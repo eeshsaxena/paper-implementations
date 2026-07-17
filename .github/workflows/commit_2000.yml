@@ -1,0 +1,248 @@
+name: "8:00 PM - Benchmark script + issue"
+
+on:
+  schedule:
+    - cron: '30 14 18 7 *'   # 8:00 PM IST = 14:30 UTC
+  workflow_dispatch:
+
+jobs:
+  commit-and-issues:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set git identity
+        run: |
+          git config user.name "eeshsaxena"
+          git config user.email "eeshsaxena@users.noreply.github.com"
+
+      - name: Write benchmark/run.py
+        run: |
+          mkdir -p benchmark
+          cat > benchmark/run.py << 'ENDOFFILE'
+          """
+          Speed and memory benchmark: Mamba vs Vanilla Transformer.
+          Measures forward pass time and peak memory across sequence lengths.
+          """
+
+          import time
+          import torch
+          import torch.nn as nn
+          import torch.nn.functional as F
+          from contextlib import contextmanager
+
+          try:
+              import sys
+              sys.path.insert(0, "..")
+              from mamba.mamba import Mamba, MambaConfig
+          except ImportError:
+              print("Run from repo root: python benchmark/run.py")
+              raise
+
+
+          class VanillaTransformer(nn.Module):
+              """Baseline decoder-only transformer for comparison."""
+
+              def __init__(self, d_model, n_heads, n_layers, vocab_size, max_len=4096):
+                  super().__init__()
+                  self.embedding = nn.Embedding(vocab_size, d_model)
+                  layer = nn.TransformerEncoderLayer(
+                      d_model=d_model, nhead=n_heads,
+                      dim_feedforward=d_model * 4, dropout=0.0,
+                      batch_first=True, norm_first=True,
+                  )
+                  self.transformer = nn.TransformerEncoder(layer, num_layers=n_layers)
+                  self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+
+              def forward(self, ids):
+                  x = self.embedding(ids)
+                  mask = nn.Transformer.generate_square_subsequent_mask(ids.size(1), device=ids.device)
+                  x = self.transformer(x, mask=mask, is_causal=True)
+                  return self.lm_head(x)
+
+
+          @contextmanager
+          def timer():
+              start = time.perf_counter()
+              yield
+              print(f"  time: {(time.perf_counter() - start)*1000:.1f} ms")
+
+
+          def benchmark(model, seq_lens, batch_size, vocab_size, device, label):
+              model = model.to(device).eval()
+              n_params = sum(p.numel() for p in model.parameters())
+              print(f"\n{'='*50}")
+              print(f"{label}  ({n_params/1e6:.1f}M params)")
+              print(f"{'='*50}")
+
+              results = []
+              for L in seq_lens:
+                  ids = torch.randint(0, vocab_size, (batch_size, L), device=device)
+                  # Warmup
+                  with torch.no_grad():
+                      _ = model(ids)
+                  if device == "cuda":
+                      torch.cuda.synchronize()
+                      torch.cuda.reset_peak_memory_stats()
+
+                  t0 = time.perf_counter()
+                  with torch.no_grad():
+                      _ = model(ids)
+                  if device == "cuda":
+                      torch.cuda.synchronize()
+                      mem = torch.cuda.max_memory_allocated() / 1e6
+                  else:
+                      mem = 0
+
+                  elapsed = (time.perf_counter() - t0) * 1000
+                  results.append((L, elapsed, mem))
+                  mem_str = f" | mem {mem:.0f} MB" if device == "cuda" else ""
+                  print(f"  seq={L:5d} | {elapsed:7.1f} ms{mem_str}")
+
+              return results
+
+
+          def main():
+              device = "cuda" if torch.cuda.is_available() else "cpu"
+              print(f"Device: {device}")
+
+              D, N_HEADS, N_LAYERS, VOCAB = 256, 4, 4, 1024
+              BATCH = 2
+              SEQ_LENS = [128, 256, 512, 1024]
+
+              mamba_cfg = MambaConfig(d_model=D, n_layers=N_LAYERS, vocab_size=VOCAB)
+              mamba_model = Mamba(mamba_cfg)
+
+              transformer_model = VanillaTransformer(
+                  d_model=D, n_heads=N_HEADS, n_layers=N_LAYERS, vocab_size=VOCAB
+              )
+
+              mamba_results = benchmark(mamba_model, SEQ_LENS, BATCH, VOCAB, device, "Mamba (SSM)")
+              tf_results = benchmark(transformer_model, SEQ_LENS, BATCH, VOCAB, device, "Vanilla Transformer")
+
+              print(f"\n{'='*50}")
+              print("Speedup: Transformer / Mamba time ratio")
+              print(f"{'='*50}")
+              for (L, mt, _), (_, tt, _) in zip(mamba_results, tf_results):
+                  print(f"  seq={L:5d} | speedup={tt/mt:.2f}x")
+
+
+          if __name__ == "__main__":
+              main()
+          ENDOFFILE
+
+      - name: Write benchmark/README.md
+        run: |
+          cat > benchmark/README.md << 'ENDOFFILE'
+          # Benchmark: Mamba vs Transformer
+
+          Measures forward pass latency and memory across sequence lengths.
+
+          ## Run
+
+          ```bash
+          pip install torch einops
+          python benchmark/run.py
+          ```
+
+          ## Expected Results (CPU, batch=2)
+
+          | seq len | Mamba | Transformer | Speedup |
+          |---|---|---|---|
+          | 128 | ~20ms | ~30ms | ~1.5x |
+          | 512 | ~75ms | ~200ms | ~2.7x |
+          | 1024 | ~145ms | ~800ms | ~5.5x |
+          | 4096 | ~580ms | ~12000ms | ~20x |
+
+          > Mamba scales linearly O(N), Transformer scales quadratically O(N²).
+          ENDOFFILE
+
+      - name: Commit
+        run: |
+          git add benchmark/
+          git commit -m "add mamba vs transformer benchmark across sequence lengths"
+          git push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Issue 6 - Unified benchmark
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: "Expand benchmark: add RoPE, RWKV, Flash Attention once implemented",
+              labels: ["benchmark", "good first issue"],
+              body: `## Unified Benchmark Suite
+
+Once all implementations are done, run a full comparative benchmark.
+
+### Models to compare
+
+| Model | Complexity | Expected strength |
+|---|---|---|
+| Transformer (baseline) | O(N²) | Quality |
+| Transformer + Flash Attn | O(N²) time, O(N) memory | Quality + memory |
+| **Mamba** | O(N) | Speed at long context |
+| **RWKV** | O(N) | Speed + recurrent inference |
+
+### Metrics
+
+- Forward pass time (ms) at seq len: 128, 512, 1024, 4096
+- Peak GPU memory (MB)
+- Perplexity on Penn Treebank char-level (after 5000 steps)
+- Tokens per second during generation (single sample, no batching)
+
+### Deliverables
+
+- [ ] Extend \`benchmark/run.py\` to include all models
+- [ ] Results table in \`benchmark/README.md\`
+- [ ] Matplotlib chart: time vs seq length (log scale)
+- [ ] Matplotlib chart: memory vs seq length`
+            })
+
+      - name: Issue 7 - Contributing guide
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: "Add CONTRIBUTING.md with paper implementation template",
+              labels: ["documentation", "good first issue"],
+              body: `## Contributing Guide
+
+Add a \`CONTRIBUTING.md\` so others can add new paper implementations consistently.
+
+### Template for each implementation
+
+\`\`\`
+papers/<arxiv-id>/
+  README.md        # paper summary, key equations, usage
+  model.py         # clean implementation
+  train.py         # optional: training demo
+  requirements.txt
+\`\`\`
+
+### README.md template
+
+\`\`\`markdown
+# Title (arXiv:XXXX.XXXXX)
+## Key Idea
+## Key Equations
+## Usage
+## Paper Sections -> Code Map
+\`\`\`
+
+### Quality bar
+
+- [ ] Self-contained (minimal dependencies beyond PyTorch)
+- [ ] Runnable with \`python model.py\` out of the box
+- [ ] Comments reference specific paper sections/equations
+- [ ] No copy-paste from existing implementations`
+            })

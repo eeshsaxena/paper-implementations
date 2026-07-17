@@ -1,0 +1,236 @@
+name: "10:00 AM - Mamba core + issues"
+
+on:
+  schedule:
+    - cron: '30 4 18 7 *'   # 10:00 AM IST = 04:30 UTC
+  workflow_dispatch:
+
+jobs:
+  commit-and-issues:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set git identity
+        run: |
+          git config user.name "eeshsaxena"
+          git config user.email "eeshsaxena@users.noreply.github.com"
+
+      - name: Write mamba/mamba.py
+        run: |
+          mkdir -p mamba
+          cat > mamba/mamba.py << 'ENDOFFILE'
+          """
+          Mamba: Linear-Time Sequence Modeling with Selective State Spaces
+          Paper: https://arxiv.org/abs/2312.00752  (Gu & Dao, 2023)
+
+          Key idea: make SSM parameters B, C, delta input-dependent
+          so the model can selectively remember or forget content,
+          giving attention-like recall in O(N) time instead of O(N^2).
+          """
+
+          import math
+          import torch
+          import torch.nn as nn
+          import torch.nn.functional as F
+          from einops import rearrange, repeat
+
+
+          class MambaConfig:
+              def __init__(
+                  self, d_model=128, d_state=16, d_conv=4, expand=2,
+                  n_layers=4, vocab_size=256, dt_rank="auto",
+                  dt_min=0.001, dt_max=0.1, bias=False, conv_bias=True,
+              ):
+                  self.d_model = d_model
+                  self.d_state = d_state
+                  self.d_conv = d_conv
+                  self.expand = expand
+                  self.d_inner = int(expand * d_model)
+                  self.n_layers = n_layers
+                  self.vocab_size = vocab_size
+                  self.dt_rank = math.ceil(d_model / 16) if dt_rank == "auto" else dt_rank
+                  self.dt_min = dt_min
+                  self.dt_max = dt_max
+                  self.bias = bias
+                  self.conv_bias = conv_bias
+
+
+          class SelectiveSSM(nn.Module):
+              """S6: Selective Scan (Section 3.2) — core of Mamba."""
+
+              def __init__(self, cfg):
+                  super().__init__()
+                  self.d_inner, self.d_state, self.dt_rank = cfg.d_inner, cfg.d_state, cfg.dt_rank
+                  self.x_proj = nn.Linear(cfg.d_inner, cfg.dt_rank + 2 * cfg.d_state, bias=False)
+                  self.dt_proj = nn.Linear(cfg.dt_rank, cfg.d_inner, bias=True)
+                  A = repeat(torch.arange(1, cfg.d_state + 1, dtype=torch.float32), "n -> d n", d=cfg.d_inner)
+                  self.A_log = nn.Parameter(torch.log(A))
+                  self.D = nn.Parameter(torch.ones(cfg.d_inner))
+
+              def forward(self, x):
+                  B, L, _ = x.shape
+                  A = -torch.exp(self.A_log.float())
+                  xp = self.x_proj(x)
+                  delta, B_s, C_s = xp.split([self.dt_rank, self.d_state, self.d_state], dim=-1)
+                  delta = F.softplus(self.dt_proj(delta))
+                  dA = torch.exp(torch.einsum("bld,dn->bldn", delta, A))
+                  dBu = torch.einsum("bld,bln,bld->bldn", delta, B_s, x)
+                  h = torch.zeros(B, self.d_inner, self.d_state, device=x.device)
+                  ys = []
+                  for t in range(L):
+                      h = dA[:, t] * h + dBu[:, t]
+                      ys.append(torch.einsum("bdn,bn->bd", h, C_s[:, t]))
+                  return torch.stack(ys, dim=1) + x * self.D
+
+
+          class MambaBlock(nn.Module):
+              """Single Mamba block: conv -> SSM with gating (Figure 3)."""
+
+              def __init__(self, cfg):
+                  super().__init__()
+                  self.in_proj = nn.Linear(cfg.d_model, cfg.d_inner * 2, bias=cfg.bias)
+                  self.conv1d = nn.Conv1d(cfg.d_inner, cfg.d_inner, cfg.d_conv,
+                                          padding=cfg.d_conv - 1, groups=cfg.d_inner, bias=cfg.conv_bias)
+                  self.ssm = SelectiveSSM(cfg)
+                  self.out_proj = nn.Linear(cfg.d_inner, cfg.d_model, bias=cfg.bias)
+                  self.norm = nn.LayerNorm(cfg.d_model)
+
+              def forward(self, x):
+                  res = x
+                  x_ssm, z = self.in_proj(self.norm(x)).chunk(2, dim=-1)
+                  x_ssm = rearrange(x_ssm, "b l d -> b d l")
+                  x_ssm = self.conv1d(x_ssm)[..., :x.shape[1]]
+                  x_ssm = rearrange(x_ssm, "b d l -> b l d")
+                  return self.out_proj(self.ssm(F.silu(x_ssm)) * F.silu(z)) + res
+
+
+          class Mamba(nn.Module):
+              def __init__(self, cfg):
+                  super().__init__()
+                  self.embedding = nn.Embedding(cfg.vocab_size, cfg.d_model)
+                  self.layers = nn.ModuleList([MambaBlock(cfg) for _ in range(cfg.n_layers)])
+                  self.norm_f = nn.LayerNorm(cfg.d_model)
+                  self.lm_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
+                  self.lm_head.weight = self.embedding.weight
+
+              def forward(self, ids):
+                  x = self.embedding(ids)
+                  for layer in self.layers:
+                      x = layer(x)
+                  return self.lm_head(self.norm_f(x))
+
+
+          if __name__ == "__main__":
+              cfg = MambaConfig(d_model=64, d_state=16, n_layers=2, vocab_size=128)
+              model = Mamba(cfg)
+              ids = torch.randint(0, cfg.vocab_size, (2, 32))
+              out = model(ids)
+              assert out.shape == (2, 32, cfg.vocab_size)
+              n = sum(p.numel() for p in model.parameters())
+              print(f"Mamba params: {n/1e3:.1f}K | output shape: {tuple(out.shape)}")
+          ENDOFFILE
+
+      - name: Write mamba/README.md
+        run: |
+          cat > mamba/README.md << 'ENDOFFILE'
+          # Mamba: Selective State Space Model
+
+          Implementation of **Mamba: Linear-Time Sequence Modeling with Selective State Spaces**
+          > Gu & Dao (2023) — [arXiv:2312.00752](https://arxiv.org/abs/2312.00752)
+
+          ## Key Insight
+
+          Standard SSMs have fixed parameters. Mamba makes B, C, and delta **input-dependent**,
+          giving it selective recall in **O(N) time** vs O(N²) for attention.
+
+          ## Usage
+
+          ```python
+          from mamba import Mamba, MambaConfig
+          cfg = MambaConfig(d_model=128, n_layers=4, vocab_size=50257)
+          model = Mamba(cfg)
+          logits = model(token_ids)
+          ```
+
+          ## Run
+
+          ```bash
+          pip install torch einops
+          python mamba.py
+          ```
+          ENDOFFILE
+
+      - name: Write mamba/requirements.txt
+        run: |
+          printf 'torch>=2.0.0\neinops>=0.7.0\n' > mamba/requirements.txt
+
+      - name: Commit
+        run: |
+          git add mamba/
+          git commit -m "add mamba selective ssm implementation (arXiv:2312.00752)"
+          git push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Issue 1 - Flash Attention
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: "Implement Flash Attention (arXiv:2205.14135)",
+              labels: ["enhancement", "paper"],
+              body: `## Flash Attention: Fast and Memory-Efficient Exact Attention
+
+**Paper:** https://arxiv.org/abs/2205.14135
+**Authors:** Tri Dao et al. (2022)
+
+### Problem
+
+Standard attention writes the full N×N matrix to slow HBM memory — O(N²) memory.
+
+### Solution
+
+Tile the computation to stay in fast SRAM. Same exact result, O(N) memory.
+
+### Tasks
+
+- [ ] Naive scaled dot-product attention baseline
+- [ ] Tiled forward pass (Algorithm 1)
+- [ ] Online softmax trick
+- [ ] Benchmarks: memory and speed vs naive at N = 512, 1024, 2048, 4096
+- [ ] Verify outputs match naive implementation exactly`
+            })
+
+      - name: Issue 2 - LoRA
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: "Implement LoRA: Low-Rank Adaptation (arXiv:2106.09685)",
+              labels: ["enhancement", "paper"],
+              body: `## LoRA: Low-Rank Adaptation of Large Language Models
+
+**Paper:** https://arxiv.org/abs/2106.09685
+**Authors:** Hu et al. (2021)
+
+### Idea
+
+Freeze base weights W. Train small low-rank delta: W' = W + (alpha/r) * B @ A
+where A is (d×r) and B is (r×k), with r << min(d,k).
+
+### Tasks
+
+- [ ] \`LoRALinear\` layer wrapping frozen \`nn.Linear\`
+- [ ] \`apply_lora(model, r, alpha, target_modules)\` utility
+- [ ] Merge/unmerge weights for zero-overhead inference
+- [ ] Demo: fine-tune tiny GPT on Shakespeare, compare param count vs full fine-tune`
+            })

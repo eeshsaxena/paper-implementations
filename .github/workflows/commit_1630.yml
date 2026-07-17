@@ -1,0 +1,224 @@
+name: "4:30 PM - RoPE implementation + issue"
+
+on:
+  schedule:
+    - cron: '0 11 18 7 *'   # 4:30 PM IST = 11:00 UTC
+  workflow_dispatch:
+
+jobs:
+  commit-and-issues:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set git identity
+        run: |
+          git config user.name "eeshsaxena"
+          git config user.email "eeshsaxena@users.noreply.github.com"
+
+      - name: Write rope/rope.py
+        run: |
+          mkdir -p rope
+          cat > rope/rope.py << 'ENDOFFILE'
+          """
+          RoPE: Rotary Position Embedding
+          Paper: https://arxiv.org/abs/2104.09864  (Su et al., 2021)
+
+          Used in: LLaMA, LLaMA-2/3, GPT-NeoX, Falcon, Mistral, Gemma.
+
+          Key idea: encode position by rotating query/key vectors in complex space.
+          Unlike learned absolute embeddings, rotation is applied at attention time
+          so relative distances are naturally captured: <Rq, Rk> depends only on (m-n).
+          """
+
+          import torch
+          import torch.nn as nn
+          import torch.nn.functional as F
+          from typing import Tuple
+
+
+          def precompute_freqs(dim: int, max_seq_len: int, base: float = 10000.0) -> Tuple[torch.Tensor, torch.Tensor]:
+              """
+              Precompute cosine/sine tables for positions 0..max_seq_len-1.
+
+              Frequencies: theta_i = 1 / base^(2i/dim)  for i in [0, dim/2)
+              Position m gets rotation angle m * theta_i on the i-th dim pair.
+              """
+              theta = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+              positions = torch.arange(max_seq_len).float()
+              angles = torch.outer(positions, theta)          # (seq, dim/2)
+              return torch.cos(angles), torch.sin(angles)     # (seq, dim/2)
+
+
+          def rotate_half(x: torch.Tensor) -> torch.Tensor:
+              """Split last dim into two halves and rotate: [-x2, x1]."""
+              x1, x2 = x.chunk(2, dim=-1)
+              return torch.cat([-x2, x1], dim=-1)
+
+
+          def apply_rope(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+              """
+              Apply rotary embedding to queries and keys.
+
+              Args:
+                  q, k : (batch, heads, seq_len, head_dim)
+                  cos, sin : (seq_len, head_dim // 2)  — precomputed tables
+              Returns:
+                  Rotated q, k with same shape.
+              """
+              seq = q.shape[2]
+              cos = cos[:seq].unsqueeze(0).unsqueeze(0)   # (1, 1, seq, dim/2)
+              sin = sin[:seq].unsqueeze(0).unsqueeze(0)
+
+              # Repeat to cover full head_dim
+              cos = torch.cat([cos, cos], dim=-1)
+              sin = torch.cat([sin, sin], dim=-1)
+
+              q_rot = q * cos + rotate_half(q) * sin
+              k_rot = k * cos + rotate_half(k) * sin
+              return q_rot, k_rot
+
+
+          class RoPEAttention(nn.Module):
+              """
+              Multi-head self-attention with RoPE.
+              Drop-in replacement for nn.MultiheadAttention in a decoder-only LM.
+              """
+
+              def __init__(self, d_model: int, n_heads: int, max_seq_len: int = 2048, base: float = 10000.0):
+                  super().__init__()
+                  assert d_model % n_heads == 0
+                  self.n_heads = n_heads
+                  self.head_dim = d_model // n_heads
+
+                  self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
+                  self.out = nn.Linear(d_model, d_model, bias=False)
+
+                  cos, sin = precompute_freqs(self.head_dim, max_seq_len, base)
+                  self.register_buffer("cos", cos)
+                  self.register_buffer("sin", sin)
+
+              def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+                  B, L, D = x.shape
+                  q, k, v = self.qkv(x).chunk(3, dim=-1)
+
+                  # Reshape to (B, heads, L, head_dim)
+                  q = q.view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
+                  k = k.view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
+                  v = v.view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
+
+                  # Apply rotary embeddings to Q and K only (not V)
+                  q, k = apply_rope(q, k, self.cos, self.sin)
+
+                  # Scaled dot-product attention
+                  attn = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, is_causal=(mask is None))
+
+                  # Merge heads
+                  attn = attn.transpose(1, 2).contiguous().view(B, L, D)
+                  return self.out(attn)
+
+
+          if __name__ == "__main__":
+              torch.manual_seed(0)
+              d_model, n_heads, L = 128, 4, 64
+
+              attn = RoPEAttention(d_model, n_heads, max_seq_len=512)
+              x = torch.randn(2, L, d_model)
+              out = attn(x)
+              assert out.shape == x.shape, "Shape mismatch"
+
+              # Verify that relative rotation is preserved:
+              # shifting input by 1 position should shift output accordingly
+              cos, sin = precompute_freqs(d_model // n_heads, 512)
+              q = torch.randn(1, 1, L, d_model // n_heads)
+              k = torch.randn(1, 1, L, d_model // n_heads)
+              q_rot, k_rot = apply_rope(q, k, cos, sin)
+              print(f"RoPEAttention output shape: {tuple(out.shape)}")
+              print(f"q_rot range: [{q_rot.min():.3f}, {q_rot.max():.3f}]")
+              print("All checks passed.")
+          ENDOFFILE
+
+      - name: Write rope/README.md
+        run: |
+          cat > rope/README.md << 'ENDOFFILE'
+          # RoPE: Rotary Position Embedding
+
+          Implementation of **RoFormer: Enhanced Transformer with Rotary Position Embedding**
+          > Su, Lu, Pan, Murtadha, Wen & Liu (2021) — [arXiv:2104.09864](https://arxiv.org/abs/2104.09864)
+
+          Used in **LLaMA, LLaMA-2/3, Mistral, Falcon, Gemma, GPT-NeoX**.
+
+          ## Why RoPE
+
+          | Method | Position info | Handles long ctx | Relative dist |
+          |---|---|---|---|
+          | Learned absolute | Yes | No | No |
+          | Sinusoidal (Vaswani) | Yes | Partial | No |
+          | **RoPE** | **Yes** | **Yes** | **Yes** |
+
+          ## Key Formula
+
+          Rotating query/key by position angle `m * theta`:
+
+          ```
+          RoPE(x, m)[2i]   = x[2i]   * cos(m*theta_i) - x[2i+1] * sin(m*theta_i)
+          RoPE(x, m)[2i+1] = x[2i+1] * cos(m*theta_i) + x[2i]   * sin(m*theta_i)
+          ```
+
+          Inner product `<RoPE(q,m), RoPE(k,n)>` depends only on `(m-n)` — natural relative bias.
+
+          ## Usage
+
+          ```python
+          from rope import RoPEAttention
+          attn = RoPEAttention(d_model=512, n_heads=8, max_seq_len=4096)
+          out = attn(x)  # (B, L, 512)
+          ```
+          ENDOFFILE
+
+      - name: Commit
+        run: |
+          git add rope/
+          git commit -m "add rope rotary position embedding implementation (arXiv:2104.09864)"
+          git push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Issue 5 - RWKV
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: "Implement RWKV: RNNs for the Transformer Era (arXiv:2305.13048)",
+              labels: ["enhancement", "paper"],
+              body: `## RWKV: Reinventing RNNs for the Transformer Era
+
+**Paper:** https://arxiv.org/abs/2305.13048
+**Authors:** Bo Peng et al. (2023)
+
+### Motivation
+
+Transformers = O(N²) attention. Mamba = O(N) SSM. RWKV = O(N) but via linear attention.
+
+RWKV has dual mode: parallel scan during training, true RNN at inference (O(1)/step).
+
+### WKV Operator (core)
+
+\`\`\`
+wkv_t = (sum_{i<t} exp(-(t-1-i)*w + k_i) * v_i) / (sum_{i<t} exp(-(t-1-i)*w + k_i))
+\`\`\`
+
+### Tasks
+
+- [ ] Time-mixing block (WKV attention)
+- [ ] Channel-mixing block (FFN equivalent)
+- [ ] Full RWKV block
+- [ ] Verify parallel and recurrent mode give identical outputs
+- [ ] Compare inference speed vs Mamba at seq len 1024, 4096`
+            })

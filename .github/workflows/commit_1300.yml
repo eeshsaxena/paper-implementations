@@ -1,0 +1,200 @@
+name: "1:00 PM - Mamba training loop + issues"
+
+on:
+  schedule:
+    - cron: '30 7 18 7 *'   # 1:00 PM IST = 07:30 UTC
+  workflow_dispatch:
+
+jobs:
+  commit-and-issues:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set git identity
+        run: |
+          git config user.name "eeshsaxena"
+          git config user.email "eeshsaxena@users.noreply.github.com"
+
+      - name: Write mamba/train.py
+        run: |
+          cat > mamba/train.py << 'ENDOFFILE'
+          """
+          Minimal training loop for Mamba on character-level language modelling.
+          Uses tiny Shakespeare as the default dataset.
+          """
+
+          import os
+          import urllib.request
+          import torch
+          import torch.nn.functional as F
+          from torch.optim import AdamW
+          from mamba import Mamba, MambaConfig
+
+
+          DATA_URL = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
+
+
+          def get_data(path="shakespeare.txt"):
+              if not os.path.exists(path):
+                  print("Downloading tiny Shakespeare...")
+                  urllib.request.urlretrieve(DATA_URL, path)
+              text = open(path).read()
+              chars = sorted(set(text))
+              stoi = {c: i for i, c in enumerate(chars)}
+              itos = {i: c for c, i in stoi.items()}
+              data = torch.tensor([stoi[c] for c in text], dtype=torch.long)
+              return data, stoi, itos
+
+
+          def get_batch(data, block_size, batch_size, device):
+              ix = torch.randint(len(data) - block_size, (batch_size,))
+              x = torch.stack([data[i: i + block_size] for i in ix]).to(device)
+              y = torch.stack([data[i + 1: i + block_size + 1] for i in ix]).to(device)
+              return x, y
+
+
+          @torch.no_grad()
+          def estimate_loss(model, data, block_size, batch_size, device, steps=50):
+              model.eval()
+              losses = []
+              for _ in range(steps):
+                  x, y = get_batch(data, block_size, batch_size, device)
+                  logits = model(x)
+                  loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+                  losses.append(loss.item())
+              model.train()
+              return sum(losses) / len(losses)
+
+
+          def train(
+              d_model=128,
+              n_layers=4,
+              block_size=128,
+              batch_size=16,
+              lr=3e-4,
+              max_steps=2000,
+              eval_every=200,
+              device=None,
+          ):
+              device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+              print(f"Training on {device}")
+
+              data, stoi, itos = get_data()
+              vocab_size = len(stoi)
+              split = int(0.9 * len(data))
+              train_data, val_data = data[:split], data[split:]
+
+              cfg = MambaConfig(
+                  d_model=d_model, n_layers=n_layers,
+                  vocab_size=vocab_size, d_state=16,
+              )
+              model = Mamba(cfg).to(device)
+              n_params = sum(p.numel() for p in model.parameters())
+              print(f"Model: {n_params/1e6:.2f}M params | vocab: {vocab_size}")
+
+              opt = AdamW(model.parameters(), lr=lr)
+
+              for step in range(max_steps):
+                  x, y = get_batch(train_data, block_size, batch_size, device)
+                  logits = model(x)
+                  loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+                  opt.zero_grad()
+                  loss.backward()
+                  torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                  opt.step()
+
+                  if step % eval_every == 0 or step == max_steps - 1:
+                      val_loss = estimate_loss(model, val_data, block_size, batch_size, device)
+                      print(f"step {step:4d} | train loss {loss.item():.4f} | val loss {val_loss:.4f}")
+
+              # Sample a few chars
+              model.eval()
+              ctx = torch.zeros(1, 1, dtype=torch.long, device=device)
+              tokens = model(ctx)
+              print("\nSample:", "".join(itos[i] for i in ctx[0].tolist()))
+              return model
+
+
+          if __name__ == "__main__":
+              train()
+          ENDOFFILE
+
+      - name: Commit
+        run: |
+          git add mamba/train.py
+          git commit -m "add mamba training loop on tiny shakespeare"
+          git push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Issue 3 - DPO
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: "Implement DPO: Direct Preference Optimization (arXiv:2305.18290)",
+              labels: ["enhancement", "paper"],
+              body: `## Direct Preference Optimization
+
+**Paper:** https://arxiv.org/abs/2305.18290
+**Authors:** Rafailov et al. (2023)
+
+### Motivation
+
+RLHF needs a separate reward model + PPO loop. DPO eliminates both.
+The optimal RLHF policy can be expressed as a closed-form BCE loss on preference pairs.
+
+### DPO Loss (Eq. 7)
+
+\`\`\`
+L = -E[ log sigmoid(
+      beta * (log pi(y_w|x)/pi_ref(y_w|x))
+           - (log pi(y_l|x)/pi_ref(y_l|x))
+    )]
+\`\`\`
+
+### Tasks
+
+- [ ] DPO loss function
+- [ ] Reference policy (frozen model copy)
+- [ ] Preference pair dataset class
+- [ ] Training loop with beta sweep
+- [ ] Compare with SFT baseline`
+            })
+
+      - name: Issue 4 - DiT
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: "Implement DiT: Diffusion Transformers (arXiv:2212.09748)",
+              labels: ["enhancement", "paper"],
+              body: `## Scalable Diffusion Models with Transformers (DiT)
+
+**Paper:** https://arxiv.org/abs/2212.09748
+**Authors:** Peebles & Xie (2022)
+
+### Why it matters
+
+DiT replaces the U-Net backbone in diffusion models with a plain ViT.
+adaLN-Zero conditioning makes each block start as identity for stable training.
+This is the architecture behind Stable Diffusion 3 and Sora.
+
+### Tasks
+
+- [ ] Patchify images into token sequences
+- [ ] DiT block with adaLN-Zero (timestep + class conditioning)
+- [ ] Final unpatchify layer
+- [ ] DDPM noise schedule
+- [ ] Demo on MNIST (generate digit samples after 100 epochs)
+- [ ] FID score comparison vs U-Net baseline`
+            })
